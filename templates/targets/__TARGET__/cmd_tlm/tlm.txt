@@ -1,0 +1,3 @@
+# Telemetry definitions — regenerate with helpers/discover_ros2.sh.
+# Each topic becomes one TELEMETRY packet, routed by `APPEND_ID_ITEM TOPIC`
+# against the rosbridge `$.topic` field.

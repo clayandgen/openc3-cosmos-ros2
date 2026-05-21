@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# scaffold-ros2-plugin — bootstrap a new OpenC3 COSMOS ROS2 plugin.
+#
+# Usage:
+#   scaffold-ros2-plugin --target TURTLEBOT --out /path/to/openc3-cosmos-ros2-turtlebot
+#
+# Copies the scaffolding template (lib/rosbridge_interface.py, plugin.txt,
+# requirements.txt, target stubs) into <out>, substitutes the target name,
+# and optionally regenerates cmd.txt/tlm.txt against a live ROS2 graph.
+#
+#   --target NAME       COSMOS target name (UPPERCASE). Required.
+#   --out DIR           Plugin output directory. Required. Must exist OR will be created.
+#   --plugin-name NAME  Gem/plugin slug (default: openc3-cosmos-ros2-<lowercased target>).
+#   --discover          After copying, run helpers/discover_ros2.sh and write
+#                       cmd.txt/tlm.txt + topics.txt against the live graph.
+#   --force             Overwrite existing files.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TEMPLATE_DIR="${ROOT_DIR}/templates"
+
+TARGET=""
+OUT=""
+PLUGIN_NAME=""
+DISCOVER=0
+FORCE=0
+
+usage() {
+  sed -n '2,17p' "$0"
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target)       TARGET="$2"; shift 2 ;;
+    --out)          OUT="$2"; shift 2 ;;
+    --plugin-name)  PLUGIN_NAME="$2"; shift 2 ;;
+    --discover)     DISCOVER=1; shift ;;
+    --force)        FORCE=1; shift ;;
+    -h|--help)      usage ;;
+    *) echo "error: unknown arg: $1" >&2; usage ;;
+  esac
+done
+
+[[ -z "$TARGET" ]] && { echo "error: --target required" >&2; usage; }
+[[ -z "$OUT"    ]] && { echo "error: --out required" >&2; usage; }
+
+# Normalize
+TARGET_UPPER="$(printf '%s' "$TARGET" | tr '[:lower:]' '[:upper:]')"
+TARGET_LOWER="$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')"
+[[ -z "$PLUGIN_NAME" ]] && PLUGIN_NAME="openc3-cosmos-ros2-${TARGET_LOWER}"
+
+mkdir -p "$OUT"
+
+copy_file() {
+  local src="$1" dst="$2"
+  if [[ -e "$dst" && $FORCE -ne 1 ]]; then
+    echo "  skip (exists): $dst"
+    return
+  fi
+  mkdir -p "$(dirname "$dst")"
+  # Substitute __TARGET__ placeholders
+  sed "s|__TARGET__|${TARGET_UPPER}|g" "$src" > "$dst"
+  echo "  wrote: $dst"
+}
+
+echo "Scaffolding ${PLUGIN_NAME} into ${OUT}"
+
+# Top-level files
+copy_file "${TEMPLATE_DIR}/plugin.txt.tmpl"   "${OUT}/plugin.txt"
+
+# Target tree (rewrite __TARGET__ in path AND content)
+while IFS= read -r -d '' src; do
+  rel="${src#${TEMPLATE_DIR}/targets/__TARGET__/}"
+  rel_subst="${rel//__TARGET__/${TARGET_UPPER}}"
+  dst="${OUT}/targets/${TARGET_UPPER}/${rel_subst}"
+  copy_file "$src" "$dst"
+done < <(find "${TEMPLATE_DIR}/targets/__TARGET__" -type f -print0)
+
+# Vendor the rosbridge subscribe protocol
+copy_file "${TEMPLATE_DIR}/lib/rosbridge_subscribe_protocol.py" \
+          "${OUT}/targets/${TARGET_UPPER}/lib/rosbridge_subscribe_protocol.py"
+
+# gemspec stub
+GEMSPEC="${OUT}/${PLUGIN_NAME}.gemspec"
+if [[ -e "$GEMSPEC" && $FORCE -ne 1 ]]; then
+  echo "  skip (exists): $GEMSPEC"
+else
+  cat > "$GEMSPEC" <<EOF
+Gem::Specification.new do |s|
+  s.name        = "${PLUGIN_NAME}"
+  s.version     = ENV['PLUGIN_VERSION'] || '0.0.1'
+  s.summary     = "OpenC3 COSMOS plugin for ${TARGET_UPPER} (ROS2 via rosbridge)"
+  s.description = "Generated from openc3-cosmos-ros2 scaffolding."
+  s.authors     = ['You']
+  s.license     = 'AGPL-3.0-only'
+  s.files       = Dir['plugin.txt','LICENSE.txt','README.md','targets/**/*']
+end
+EOF
+  echo "  wrote: $GEMSPEC"
+fi
+
+# Rakefile (standard COSMOS plugin build target)
+RAKEFILE="${OUT}/Rakefile"
+if [[ -e "$RAKEFILE" && $FORCE -ne 1 ]]; then
+  echo "  skip (exists): $RAKEFILE"
+else
+  cat > "$RAKEFILE" <<'EOF'
+require 'openc3/utilities/rake_helper'
+task :require_version do
+  unless ENV['VERSION']
+    puts "VERSION is required: rake build VERSION=X.X.X"; exit 1
+  end
+end
+task :build => [:require_version] do
+  _, platform, *_ = RUBY_PLATFORM.split("-")
+  if platform == 'mswin32' || platform == 'mingw32'
+    puts `rake.cmd build VERSION=#{ENV['VERSION']}`
+  else
+    puts `rake build VERSION=#{ENV['VERSION']}`
+  end
+end
+EOF
+  echo "  wrote: $RAKEFILE"
+fi
+
+if [[ $DISCOVER -eq 1 ]]; then
+  echo "Running discovery against live ROS2 graph..."
+  "${ROOT_DIR}/helpers/discover_ros2.sh" \
+    --target "${TARGET_UPPER}" \
+    --out-dir "${OUT}/targets/${TARGET_UPPER}/cmd_tlm" \
+    --topics-file "${OUT}/targets/${TARGET_UPPER}/lib/topics.txt"
+fi
+
+cat <<EOF
+
+Done. Next steps:
+  1. cd ${OUT}
+  2. Write README.md (link back to https://github.com/clayandgen/openc3-cosmos-ros2).
+  3. On your ROS2 host: \`ros2 launch rosbridge_server rosbridge_tcp.launch.xml\`
+  4. If you didn't pass --discover, regenerate cmd/tlm against your live graph:
+       ${ROOT_DIR}/helpers/discover_ros2.sh \\
+         --target ${TARGET_UPPER} \\
+         --out-dir targets/${TARGET_UPPER}/cmd_tlm \\
+         --topics-file targets/${TARGET_UPPER}/lib/topics.txt
+  5. \`rake build VERSION=0.0.1\` and install the gem in COSMOS.
+EOF

@@ -1,0 +1,28 @@
+# OpenC3 COSMOS ROS2 Plugin — scaffolded from openc3-cosmos-ros2
+#
+# Bridges to ROS2 via rosbridge_suite's TCP transport. On the ROS2 host:
+#     sudo apt install ros-${ROS_DISTRO}-rosbridge-suite
+#     ros2 launch rosbridge_server rosbridge_tcp.launch.xml
+# (use rosbridge_tcp, NOT rosbridge_websocket — this plugin speaks raw TCP
+# with null-byte framing.)
+#
+# Topic subscriptions are driven by lib/topics.txt (one topic per line).
+
+VARIABLE ros2_target_name __TARGET__
+VARIABLE_DESCRIPTION "COSMOS target name for this ROS2 robot"
+
+VARIABLE rosbridge_host host.docker.internal
+VARIABLE_DESCRIPTION "Host running rosbridge_tcp (laptop / robot)"
+
+VARIABLE rosbridge_port 9090
+VARIABLE_DESCRIPTION "rosbridge_tcp port (default 9090)"
+
+TARGET __TARGET__ <%= ros2_target_name %>
+
+INTERFACE <%= ros2_target_name %>_INT openc3/interfaces/tcpip_client_interface.py <%= rosbridge_host %> <%= rosbridge_port %> <%= rosbridge_port %> 10.0 nil BURST
+  MAP_TARGET <%= ros2_target_name %>
+  # Frame each JSON envelope with a trailing NUL — the wire format
+  # rosbridge_tcp expects.
+  PROTOCOL READ_WRITE openc3/interfaces/protocols/terminated_protocol.py 0x00 0x00 True 0 nil False
+  # Send `subscribe` ops on connect for every topic in lib/topics.txt.
+  PROTOCOL READ_WRITE lib/rosbridge_subscribe_protocol.py lib/topics.txt
