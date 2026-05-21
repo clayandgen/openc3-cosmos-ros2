@@ -71,21 +71,15 @@ echo "Scaffolding ${PLUGIN_NAME} into ${OUT}"
 # Top-level files
 copy_file "${TEMPLATE_DIR}/plugin.txt.tmpl"   "${OUT}/plugin.txt"
 
-# Target tree (rewrite __TARGET__ in path AND content)
-while IFS= read -r -d '' src; do
-  rel="${src#${TEMPLATE_DIR}/targets/__TARGET__/}"
-  rel_subst="${rel//__TARGET__/${TARGET_UPPER}}"
-  dst="${OUT}/targets/${TARGET_UPPER}/${rel_subst}"
-  copy_file "$src" "$dst"
-done < <(find "${TEMPLATE_DIR}/targets/__TARGET__" -type f -print0)
-
-# Vendor the rosbridge subscribe protocol
+# Target lib files
+copy_file "${TEMPLATE_DIR}/lib/rosbridge_websocket_interface.py" \
+          "${OUT}/targets/${TARGET_UPPER}/lib/rosbridge_websocket_interface.py"
 copy_file "${TEMPLATE_DIR}/lib/rosbridge_subscribe_protocol.py" \
           "${OUT}/targets/${TARGET_UPPER}/lib/rosbridge_subscribe_protocol.py"
 
-# gemspec stub
+# gemspec stub (never overwritten — even with --force)
 GEMSPEC="${OUT}/${PLUGIN_NAME}.gemspec"
-if [[ -e "$GEMSPEC" && $FORCE -ne 1 ]]; then
+if [[ -e "$GEMSPEC" ]]; then
   echo "  skip (exists): $GEMSPEC"
 else
   cat > "$GEMSPEC" <<EOF
@@ -95,16 +89,16 @@ Gem::Specification.new do |s|
   s.summary     = "OpenC3 COSMOS plugin for ${TARGET_UPPER} (ROS2 via rosbridge)"
   s.description = "Generated from openc3-cosmos-ros2 scaffolding."
   s.authors     = ['You']
-  s.license     = 'AGPL-3.0-only'
+  s.license     = 'MIT'
   s.files       = Dir['plugin.txt','LICENSE.txt','README.md','targets/**/*']
 end
 EOF
   echo "  wrote: $GEMSPEC"
 fi
 
-# Rakefile (standard COSMOS plugin build target)
+# Rakefile (never overwritten — even with --force)
 RAKEFILE="${OUT}/Rakefile"
-if [[ -e "$RAKEFILE" && $FORCE -ne 1 ]]; then
+if [[ -e "$RAKEFILE" ]]; then
   echo "  skip (exists): $RAKEFILE"
 else
   cat > "$RAKEFILE" <<'EOF'
@@ -126,6 +120,12 @@ EOF
   echo "  wrote: $RAKEFILE"
 fi
 
+# README.md — skip if it already exists (never overwritten)
+README="${OUT}/README.md"
+if [[ -e "$README" ]]; then
+  echo "  skip (exists): $README"
+fi
+
 if [[ $DISCOVER -eq 1 ]]; then
   echo "Running discovery against live ROS2 graph..."
   "${ROOT_DIR}/helpers/discover_ros2.sh" \
@@ -139,7 +139,7 @@ cat <<EOF
 Done. Next steps:
   1. cd ${OUT}
   2. Write README.md (link back to https://github.com/clayandgen/openc3-cosmos-ros2).
-  3. On your ROS2 host: \`ros2 launch rosbridge_server rosbridge_tcp.launch.xml\`
+  3. On your ROS2 host: \`ros2 launch rosbridge_server rosbridge_websocket_launch.xml\`
   4. If you didn't pass --discover, regenerate cmd/tlm against your live graph:
        ${ROOT_DIR}/helpers/discover_ros2.sh \\
          --target ${TARGET_UPPER} \\

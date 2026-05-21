@@ -44,7 +44,10 @@ TYPE_MAP = {
 }
 
 # Topics never useful as TLM
-SKIP_TOPICS = {"/parameter_events", "/rosout"}
+SKIP_TOPICS = {"/parameter_events", "/rosout", "/client_count", "/connected_clients"}
+
+# Topic/service/node prefixes from rosbridge infrastructure — skip entirely
+SKIP_PREFIXES = ("/rosapi", "/rosbridge")
 
 # Services to skip (per-node parameter plumbing)
 SKIP_SERVICE_SUFFIXES = (
@@ -59,8 +62,10 @@ SKIP_SERVICE_SUFFIXES = (
 
 
 def sanitize(name: str) -> str:
-    """COSMOS-safe identifier: alnum + underscore, uppercase, no leading digit."""
+    """COSMOS-safe identifier: alnum + underscore, uppercase, no leading digit, no double underscore."""
     s = re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_").upper()
+    while "__" in s:
+        s = s.replace("__", "_")
     if s and s[0].isdigit():
         s = "T_" + s
     return s or "ITEM"
@@ -73,6 +78,57 @@ class Field:
     is_array: bool = False
     array_size: Optional[int] = None
     is_complex: bool = False  # non-primitive (nested msg)
+    units: Optional[str] = None  # unit abbreviation (e.g. "rad/s", "m", "deg")
+
+
+# Abbreviation -> COSMOS full name for UNITS directive
+UNITS_FULL_NAME: dict[str, str] = {
+    "rad":    "Radians",
+    "rad/s":  "Radians_per_second",
+    "rad/s^2":"Radians_per_second_squared",
+    "deg":    "Degrees",
+    "deg/s":  "Degrees_per_second",
+    "m":      "Meters",
+    "m/s":    "Meters_per_second",
+    "m/s^2":  "Meters_per_second_squared",
+    "mm":     "Millimeters",
+    "cm":     "Centimeters",
+    "km":     "Kilometers",
+    "km/h":   "Kilometers_per_hour",
+    "s":      "Seconds",
+    "ms":     "Milliseconds",
+    "us":     "Microseconds",
+    "ns":     "Nanoseconds",
+    "Hz":     "Hertz",
+    "N":      "Newtons",
+    "Nm":     "Newton_meters",
+    "Pa":     "Pascals",
+    "K":      "Kelvin",
+    "A":      "Amps",
+    "V":      "Volts",
+    "W":      "Watts",
+    "%":      "Percent",
+    "T":      "Tesla",
+    "Gs":     "Gauss",
+}
+
+# Well-known ROS2 field names -> unit abbreviation (fallback when comments lack [unit])
+KNOWN_FIELD_UNITS: dict[str, str] = {
+    "latitude":           "deg",
+    "longitude":          "deg",
+    "altitude":           "m",
+    "theta":              "rad",
+    "yaw":                "rad",
+    "pitch":              "rad",
+    "roll":               "rad",
+    "linear_velocity":    "m/s",
+    "angular_velocity":   "rad/s",
+    "linear_acceleration":"m/s^2",
+    "angular_acceleration":"rad/s^2",
+}
+
+# Regex to extract [unit] from a comment line, e.g. "# Altitude [m]. Positive is ..."
+UNIT_COMMENT_RE = re.compile(r"\[([^\]]+)\]")
 
 
 @dataclass
@@ -110,33 +166,77 @@ FIELD_RE = re.compile(
 )
 
 
+def _indent_level(line: str) -> int:
+    """Count leading tabs (ros2 interface show uses tabs for nesting)."""
+    level = 0
+    for ch in line:
+        if ch == "\t":
+            level += 1
+        elif ch == " ":
+            # Some versions use spaces; treat 2-4 leading spaces as one level
+            continue
+        else:
+            break
+    # Fallback: count leading whitespace chars / 2 if no tabs found
+    if level == 0:
+        spaces = len(line) - len(line.lstrip())
+        level = spaces // 2
+    return level
+
+
 def parse_interface_show(text: str, sections: int = 1) -> Interface:
     """Parse `ros2 interface show TYPE` output.
 
     sections=1 for msg, 2 for srv (req---resp), 3 for action (goal---result---feedback).
-    Nested msgs are flattened: we only keep top-level fields per section. Nested
-    indented lines (4 spaces or tab) are skipped — their data still rides as a
-    JSON sub-object under the parent field.
+    Nested message fields are flattened into dot-separated names (e.g. linear.x)
+    so they map to individual COSMOS items with KEY paths like $.msg.linear.x.
+    Arrays of nested types are kept as opaque STRING/JSON blobs.
     """
     iface = Interface(type_name="")
     buckets: list[list[Field]] = [[] for _ in range(sections)]
     idx = 0
+    pending_comment_unit: Optional[str] = None
+
+    # parent_stack tracks (indent_level, field_name_prefix) for nesting
+    parent_stack: list[tuple[int, str]] = []
+
     for raw in text.splitlines():
         line = raw.rstrip()
         if not line.strip():
+            pending_comment_unit = None
             continue
         if line.strip() == "---":
             idx = min(idx + 1, sections - 1)
+            pending_comment_unit = None
+            parent_stack.clear()
             continue
-        # Skip nested (indented) lines — keep only top-level fields
-        if line.startswith((" ", "\t")):
-            continue
-        # Strip inline comments
+
+        indent = _indent_level(line)
+
+        # Pop parents that are at same or deeper level than current
+        while parent_stack and parent_stack[-1][0] >= indent:
+            parent_stack.pop()
+
+        # Check for unit in comment lines (e.g. "# Altitude [m].")
         stripped = line.split("#", 1)[0].strip()
         if not stripped:
+            comment_part = line.split("#", 1)[1] if "#" in line else ""
+            um = UNIT_COMMENT_RE.search(comment_part)
+            if um:
+                pending_comment_unit = um.group(1)
+            else:
+                pending_comment_unit = None
             continue
+        # Also check inline comment for units
+        inline_unit = None
+        if "#" in line:
+            inline_comment = line.split("#", 1)[1]
+            um = UNIT_COMMENT_RE.search(inline_comment)
+            if um:
+                inline_unit = um.group(1)
         m = FIELD_RE.match(stripped)
         if not m:
+            pending_comment_unit = None
             continue
         type_name = m.group("type")
         name = m.group("name")
@@ -144,21 +244,44 @@ def parse_interface_show(text: str, sections: int = 1) -> Interface:
         arr = m.group("arr")
         # Constants (UPPER_CASE with value) — skip; not over-the-wire
         if value is not None and name.isupper():
+            pending_comment_unit = None
             continue
+
         is_array = arr is not None
         array_size = None
         if is_array:
             inner = arr[1:-1]
             if inner.isdigit():
                 array_size = int(inner)
-        is_complex = "/" in type_name
+
+        is_primitive = type_name in TYPE_MAP
+        is_complex = not is_primitive
+
+        if is_complex and not is_array:
+            # Non-primitive, non-array: push as parent; its sub-fields will
+            # be flattened as children. Don't emit this field itself.
+            prefix = ".".join(p[1] for p in parent_stack) + "." + name if parent_stack else name
+            parent_stack.append((indent, prefix))
+            pending_comment_unit = None
+            continue
+
+        # Build the full dot-separated name from parent stack
+        if parent_stack:
+            full_name = parent_stack[-1][1] + "." + name
+        else:
+            full_name = name
+
+        units = inline_unit or pending_comment_unit or KNOWN_FIELD_UNITS.get(name)
         buckets[idx].append(Field(
-            name=name,
+            name=full_name,
             ros_type=type_name,
             is_array=is_array,
             array_size=array_size,
             is_complex=is_complex,
+            units=units,
         ))
+        pending_comment_unit = None
+
     iface.fields = buckets[0]
     if sections >= 2:
         iface.response_fields = buckets[1]
@@ -196,6 +319,8 @@ def list_topics() -> list[tuple[str, str]]:
             topic, mtype = m.group(1), m.group(2)
             if topic in SKIP_TOPICS:
                 continue
+            if any(topic.startswith(p) for p in SKIP_PREFIXES):
+                continue
             result.append((topic, mtype))
     return result
 
@@ -211,6 +336,8 @@ def list_services() -> list[tuple[str, str]]:
         if m:
             svc, stype = m.group(1), m.group(2)
             if any(svc.endswith(sfx) for sfx in SKIP_SERVICE_SUFFIXES):
+                continue
+            if any(svc.startswith(p) for p in SKIP_PREFIXES):
                 continue
             result.append((svc, stype))
     return result
@@ -228,7 +355,10 @@ def list_actions() -> list[tuple[str, str]]:
             continue
         m = re.match(r"(\S+)\s+\[([^\]]+)\]", line)
         if m:
-            result.append((m.group(1), m.group(2)))
+            act = m.group(1)
+            if any(act.startswith(p) for p in SKIP_PREFIXES):
+                continue
+            result.append((act, m.group(2)))
     return result
 
 
@@ -242,6 +372,8 @@ def list_params() -> list[tuple[str, str, str]]:
     for node in nodes_out.splitlines():
         node = node.strip()
         if not node:
+            continue
+        if any(node.startswith(p) for p in SKIP_PREFIXES):
             continue
         try:
             plist = run(["ros2", "param", "list", node])
@@ -276,6 +408,15 @@ def cosmos_type_for(f: Field) -> tuple[str, int]:
     return TYPE_MAP.get(f.ros_type, ("STRING", 0))
 
 
+def emit_units(out, f: Field) -> None:
+    """Write a UNITS line if the field has units."""
+    if not f.units:
+        return
+    abbrev = f.units
+    full = UNITS_FULL_NAME.get(abbrev, re.sub(r"[^A-Za-z0-9]", "_", abbrev))
+    out.write(f'    UNITS "{full}" {abbrev}\n')
+
+
 def default_value(f: Field):
     if f.is_array:
         return []
@@ -291,6 +432,22 @@ def default_value(f: Field):
     return 0
 
 
+def build_nested_defaults(fields: list[Field]) -> dict:
+    """Build a nested dict from fields with dotted names.
+
+    e.g. fields [linear.x, linear.y, angular.x] →
+         {"linear": {"x": 0.0, "y": 0.0}, "angular": {"x": 0.0}}
+    """
+    root: dict = {}
+    for f in fields:
+        parts = f.name.split(".")
+        node = root
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = default_value(f)
+    return root
+
+
 def emit_tlm_packet(out, target: str, topic: str, iface: Interface) -> None:
     """One TELEMETRY packet per topic. Identified by $.topic so the protocol can
     route inbound rosbridge `publish` ops to the right packet purely by ID."""
@@ -303,7 +460,7 @@ def emit_tlm_packet(out, target: str, topic: str, iface: Interface) -> None:
     )
     out.write("  ACCESSOR JsonAccessor\n")
 
-    template = {"op": "publish", "topic": topic, "msg": {f.name: default_value(f) for f in iface.fields}}
+    template = {"op": "publish", "topic": topic, "msg": build_nested_defaults(iface.fields)}
     out.write(f"  TEMPLATE '{json.dumps(template)}'\n")
 
     # Routing identifier: rosbridge publishes carry "topic"
@@ -318,6 +475,7 @@ def emit_tlm_packet(out, target: str, topic: str, iface: Interface) -> None:
             f'  APPEND_ITEM {sanitize(f.name)} {bits} {ctype} "{f.ros_type}{"[]" if f.is_array else ""}"\n'
         )
         out.write(f"    KEY $.msg.{f.name}\n")
+        emit_units(out, f)
     out.write("\n")
 
 
@@ -331,7 +489,7 @@ def emit_cmd_for_publish(out, target: str, topic: str, iface: Interface) -> None
         f'COMMAND {target} {pkt_name} BIG_ENDIAN "Publish to {topic}"\n'
     )
     out.write("  ACCESSOR JsonAccessor\n")
-    template = {"op": "publish", "topic": topic, "msg": {f.name: default_value(f) for f in iface.fields}}
+    template = {"op": "publish", "topic": topic, "msg": build_nested_defaults(iface.fields)}
     out.write(f"  TEMPLATE '{json.dumps(template)}'\n")
 
     out.write(f'  APPEND_PARAMETER _OP 0 STRING "publish" "rosbridge op"\n')
@@ -356,7 +514,7 @@ def emit_cmd_for_service(out, target: str, service: str, iface: Interface) -> No
     template = {
         "op": "call_service",
         "service": service,
-        "args": {f.name: default_value(f) for f in iface.fields},
+        "args": build_nested_defaults(iface.fields),
     }
     out.write(f"  TEMPLATE '{json.dumps(template)}'\n")
 
@@ -383,7 +541,7 @@ def emit_cmd_for_action(out, target: str, action: str, iface: Interface) -> None
         "op": "send_action_goal",
         "action": action,
         "action_type": iface.type_name,
-        "args": {f.name: default_value(f) for f in iface.fields},
+        "args": build_nested_defaults(iface.fields),
     }
     out.write(f"  TEMPLATE '{json.dumps(template)}'\n")
 
@@ -454,6 +612,7 @@ def write_param_line(out, f: Field, ctype: str, bits: int, key_prefix: str) -> N
         maxv = (1 << bits) - 1
         out.write(f'  APPEND_PARAMETER {name} {bits} UINT 0 {maxv} 0 "{desc}"\n')
     out.write(f"    KEY {key_prefix}{f.name}\n")
+    emit_units(out, f)
 
 
 # ---------------------------------------------------------------------------
@@ -527,9 +686,8 @@ def generate(manifest: dict, target: str, out_dir: Path, topics_file: Optional[P
             emit_cmd_for_service(cmd, target, s["name"], _to_iface(s["iface"]))
         for a in manifest["actions"]:
             emit_cmd_for_action(cmd, target, a["name"], _to_iface(a["iface"]))
-        for p in manifest["params"]:
-            emit_cmd_for_param_get(cmd, target, p["node"], p["name"])
-            emit_cmd_for_param_set(cmd, target, p["node"], p["name"], p["type"])
+        # Parameter GET/SET commands omitted for now — rosbridge service
+        # responses aren't captured as telemetry, so these aren't useful yet.
 
     print(f"Wrote {tlm_path}", file=sys.stderr)
     print(f"Wrote {cmd_path}", file=sys.stderr)

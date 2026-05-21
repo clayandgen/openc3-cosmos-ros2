@@ -4,24 +4,20 @@ rosbridge_subscribe_protocol — OpenC3 COSMOS Protocol that issues
 `{"op":"subscribe", ...}` envelopes on connect for every topic listed in
 `topics_file`.
 
-Layered above `terminated_protocol` (which handles `\\0` framing for the
-`rosbridge_tcp` transport). All read/write data passes through unchanged —
-this protocol exists purely so a fresh TCP connection automatically
-subscribes to the topic set without anyone having to push subscribe ops by
-hand from a startup script.
+All read/write data passes through unchanged — this protocol exists purely
+so a fresh connection automatically subscribes to the topic set without
+anyone having to push subscribe ops by hand from a startup script.
 
 Plugin.txt usage:
 
-    INTERFACE TURTLEBOT_INT openc3/interfaces/tcpip_client_interface.py \\
-        host.docker.internal 9090 9090 10.0 nil BURST
+    INTERFACE TURTLEBOT_INT lib/rosbridge_websocket_interface.py \\
+        host.docker.internal 9090 10.0
       MAP_TARGET TURTLEBOT
-      PROTOCOL READ_WRITE openc3/interfaces/protocols/terminated_protocol.py \\
-        0x00 0x00 True 0 nil False
-      PROTOCOL READ_WRITE lib/rosbridge_subscribe_protocol.py lib/topics.txt
+      PROTOCOL READ_WRITE lib/rosbridge_subscribe_protocol.py lib/topics.txt 100
 
-Start the laptop bridge with the TCP launch (NOT the websocket one):
+Start the rosbridge WebSocket server on the ROS2 host:
 
-    ros2 launch rosbridge_server rosbridge_tcp.launch.xml
+    ros2 launch rosbridge_server rosbridge_websocket_launch.xml
 """
 from __future__ import annotations
 
@@ -36,9 +32,11 @@ from openc3.utilities.logger import Logger
 class RosbridgeSubscribeProtocol(Protocol):
     """Send rosbridge `subscribe` ops on connect; pass data through otherwise."""
 
-    def __init__(self, topics_file: str, allow_empty_data: Optional[str] = None):
+    def __init__(self, topics_file: str, throttle_rate: str = "0",
+                 allow_empty_data: Optional[str] = None):
         super().__init__(allow_empty_data)
         self.topics_file = topics_file
+        self.throttle_rate = int(throttle_rate)  # ms between messages per topic
 
     # ------------------------------------------------------------------
     # Lifecycle hooks
@@ -57,12 +55,20 @@ class RosbridgeSubscribeProtocol(Protocol):
     # ------------------------------------------------------------------
 
     def read_data(self, data, extra=None):
-        # Terminated protocol below already stripped the \0; nothing to do.
+        if not data or len(data) == 0:
+            return "STOP", extra
+        # Only pass through topic publish messages; drop service responses,
+        # status pings, and other rosbridge ops that have no matching TLM packet.
+        try:
+            text = data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else data
+            msg = json.loads(text)
+            if msg.get("op") != "publish":
+                return "STOP", extra
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return "STOP", extra
         return data, extra
 
     def write_data(self, data, extra=None):
-        # Commands generated from cmd.txt are already valid rosbridge JSON.
-        # Terminated protocol below will append the \0 framing byte.
         return data, extra
 
     # ------------------------------------------------------------------
@@ -90,10 +96,9 @@ class RosbridgeSubscribeProtocol(Protocol):
                 op = {"op": "subscribe", "topic": parts[0]}
                 if len(parts) > 1:
                     op["type"] = parts[1]
+                if self.throttle_rate > 0:
+                    op["throttle_rate"] = self.throttle_rate
                 payload = json.dumps(op).encode("utf-8")
-                # Re-enter the write chain from the top. The terminated protocol
-                # below us will append \0; this protocol's own write_data is a
-                # passthrough so nothing else mutates the payload.
                 self.interface.write_interface(payload)
                 count += 1
         Logger.info(f"rosbridge_subscribe: subscribed to {count} topic(s) from {path}")
@@ -102,7 +107,9 @@ class RosbridgeSubscribeProtocol(Protocol):
     def _resolve_topics_file(configured: str) -> Optional[str]:
         if os.path.isabs(configured) and os.path.isfile(configured):
             return configured
-        for base in (os.getcwd(), os.path.dirname(__file__)):
+        file_dir = os.path.dirname(__file__)
+        parent_dir = os.path.dirname(file_dir)  # target root (parent of lib/)
+        for base in (os.getcwd(), file_dir, parent_dir):
             cand = os.path.join(base, configured)
             if os.path.isfile(cand):
                 return cand

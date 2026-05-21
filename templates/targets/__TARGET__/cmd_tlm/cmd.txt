@@ -1,6 +1,0 @@
-# Command definitions — regenerate with helpers/discover_ros2.sh against your
-# live ROS2 graph, or hand-author per the rosbridge op shape:
-#
-#   {"op": "publish",         "topic": "/x", "msg": {...}}
-#   {"op": "call_service",    "service": "/x", "args": {...}}
-#   {"op": "send_action_goal","action":  "/x", "action_type": "...", "args": {...}}
